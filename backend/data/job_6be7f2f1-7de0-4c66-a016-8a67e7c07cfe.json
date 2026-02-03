@@ -1,0 +1,39 @@
+{
+  "id": "6be7f2f1-7de0-4c66-a016-8a67e7c07cfe",
+  "status": "failed",
+  "createdAt": "2026-02-02T15:59:35.174Z",
+  "updatedAt": "2026-02-02T16:37:55.285Z",
+  "options": {
+    "niches": [],
+    "countries": [
+      "ca"
+    ],
+    "opportunityTypes": [
+      "guestPost",
+      "linkInsertion"
+    ],
+    "maxPages": 5,
+    "customNiche": "Fashion"
+  },
+  "progress": {
+    "totalQueries": 3,
+    "completedQueries": 3,
+    "totalResults": 94,
+    "processedUrls": 94,
+    "emailsFound": 223,
+    "errors": 0,
+    "retries": 0
+  },
+  "errors": [
+    {
+      "message": "object is not iterable (cannot read property Symbol(Symbol.iterator))",
+      "timestamp": "2026-02-02T16:37:55.285Z"
+    }
+  ],
+  "warnings": [
+    {
+      "message": "No results found for query: Fashion submit article Canada",
+      "timestamp": "2026-02-02T16:37:55.281Z"
+    }
+  ]
+}
