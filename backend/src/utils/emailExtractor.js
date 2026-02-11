@@ -19,6 +19,19 @@ const excludePatterns = [
   /sentry\.io$/i,
   /wixpress\.com$/i,
   /cloudflare/i,
+  /^webmaster@/i,
+  /^postmaster@/i,
+  /^noreply@/i,
+  /^no-reply@/i,
+  /^donotreply@/i,
+  /^do-not-reply@/i,
+  /^mailer-daemon@/i,
+  /^abuse@/i,
+  /^spam@/i,
+  /^hostmaster@/i,
+  /^usenet@/i,
+  /^news@/i,
+  /^support@.*\.(hostinger|godaddy|bluehost|siteground|namecheap)/i,
 ];
 
 // Common prefixes that indicate real contact emails
@@ -52,7 +65,7 @@ export function extractEmails(html) {
 
   const emails = new Set();
 
-  // Extract from mailto: links
+  // 1. Extract from mailto: links (most reliable source)
   const mailtoRegex = /mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
   let match;
   while ((match = mailtoRegex.exec(html)) !== null) {
@@ -62,12 +75,82 @@ export function extractEmails(html) {
     }
   }
 
-  // Extract from visible text patterns
-  const textEmails = html.match(emailRegex) || [];
-  for (const email of textEmails) {
+  // 2. Extract from href attributes (handles cases where mailto might be embedded differently)
+  const hrefRegex = /href=["']mailto:([^"']+)["']/gi;
+  while ((match = hrefRegex.exec(html)) !== null) {
+    const emailPart = match[1].split('?')[0]; // Remove query parameters
+    const email = normalizeEmail(emailPart);
+    if (email && isValidEmail(email)) {
+      emails.add(email);
+    }
+  }
+
+  // 3. Extract from data attributes and other HTML attributes
+  const dataAttrRegex = /(?:data-email|data-mail|email)=["']([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})["']/gi;
+  while ((match = dataAttrRegex.exec(html)) !== null) {
+    const email = normalizeEmail(match[1]);
+    if (email && isValidEmail(email)) {
+      emails.add(email);
+    }
+  }
+
+  // 4. Strip HTML tags for cleaner text extraction
+  const strippedText = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '') // Remove scripts
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '') // Remove styles
+    .replace(/<[^>]+>/g, ' ') // Remove all other HTML tags
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&[a-z]+;/gi, ' '); // Remove HTML entities
+
+  // 5. Extract from visible text patterns with context awareness
+  const lines = strippedText.split(/[\n\r]+/);
+  for (const line of lines) {
+    // Look for emails in lines that contain common email-related keywords
+    const lowerLine = line.toLowerCase();
+    const hasEmailContext = /email|contact|reach|write|submit|send|mail|@/i.test(line);
+    
+    if (hasEmailContext || line.includes('@')) {
+      const textEmails = line.match(emailRegex) || [];
+      for (const email of textEmails) {
+        const normalized = normalizeEmail(email);
+        if (normalized && isValidEmail(normalized)) {
+          emails.add(normalized);
+        }
+      }
+    }
+  }
+
+  // 6. Final pass: extract ALL emails from original HTML (catches edge cases)
+  const allMatches = html.match(emailRegex) || [];
+  for (const email of allMatches) {
     const normalized = normalizeEmail(email);
     if (normalized && isValidEmail(normalized)) {
       emails.add(normalized);
+    }
+  }
+
+  // 7. Look for obfuscated emails with common patterns
+  const obfuscatedPatterns = [
+    /([a-zA-Z0-9._%+-]+)\s*\[at\]\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi,
+    /([a-zA-Z0-9._%+-]+)\s*\(at\)\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi,
+    /([a-zA-Z0-9._%+-]+)\s*@\s*([a-zA-Z0-9.-]+)\s*\[dot\]\s*([a-zA-Z]{2,})/gi,
+    /([a-zA-Z0-9._%+-]+)\s*@\s*([a-zA-Z0-9.-]+)\s*\(dot\)\s*([a-zA-Z]{2,})/gi,
+  ];
+
+  for (const pattern of obfuscatedPatterns) {
+    while ((match = pattern.exec(html)) !== null) {
+      let email;
+      if (match.length === 3) {
+        email = `${match[1]}@${match[2]}`;
+      } else if (match.length === 4) {
+        email = `${match[1]}@${match[2]}.${match[3]}`;
+      }
+      if (email) {
+        const normalized = normalizeEmail(email);
+        if (normalized && isValidEmail(normalized)) {
+          emails.add(normalized);
+        }
+      }
     }
   }
 
@@ -95,11 +178,26 @@ function normalizeEmail(email) {
     .replace(/\s+/g, '')
     .replace(/\[at\]/gi, '@')
     .replace(/\(at\)/gi, '@')
+    .replace(/\s*at\s*/gi, '@')
     .replace(/\[dot\]/gi, '.')
-    .replace(/\(dot\)/gi, '.');
+    .replace(/\(dot\)/gi, '.')
+    .replace(/\s*dot\s*/gi, '.');
 
   // Remove trailing punctuation
   normalized = normalized.replace(/[.,;:!?]+$/, '');
+  
+  // Remove leading punctuation
+  normalized = normalized.replace(/^[.,;:!?]+/, '');
+
+  // Remove any remaining whitespace
+  normalized = normalized.replace(/\s/g, '');
+
+  // Handle URL encoding
+  try {
+    normalized = decodeURIComponent(normalized);
+  } catch (e) {
+    // If decoding fails, continue with the current value
+  }
 
   return normalized;
 }
@@ -135,6 +233,23 @@ function isValidEmail(email) {
 
   // No consecutive dots
   if (email.includes('..')) return false;
+
+  // Local part should not start or end with a dot
+  if (local.startsWith('.') || local.endsWith('.')) return false;
+
+  // Domain should not start or end with a dot or hyphen
+  if (domain.startsWith('.') || domain.endsWith('.') || 
+      domain.startsWith('-') || domain.endsWith('-')) {
+    return false;
+  }
+
+  // Check for valid characters in local part
+  const validLocalRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+$/;
+  if (!validLocalRegex.test(local)) return false;
+
+  // Check for valid characters in domain
+  const validDomainRegex = /^[a-zA-Z0-9.-]+$/;
+  if (!validDomainRegex.test(domain)) return false;
 
   return true;
 }

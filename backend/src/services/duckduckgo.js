@@ -1,32 +1,66 @@
 import axios from 'axios';
 import { parse } from 'node-html-parser';
 import { config } from '../config/index.js';
+import crypto from 'crypto';
+import http from 'http';
+import https from 'https';
 
+// Expanded user agent pool with more diversity
 const USER_AGENTS = [
-  // Desktop Chrome versions
+  // Windows Chrome (various versions)
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-  // Firefox versions
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+  // Mac Chrome
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  // Windows Firefox
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+  // Mac Firefox
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
-  // Safari versions
+  // Safari
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-  // Mobile agents
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.101 Mobile Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+  // Edge
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
 ];
 
-// Track user agent rotation
-let currentUserAgentIndex = 0;
+// Browser fingerprint simulation
+const BROWSER_PROFILES = {
+  chrome: {
+    secChUa: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    secChUaMobile: '?0',
+    secChUaPlatform: '"Windows"',
+  },
+  firefox: {
+    // Firefox doesn't send sec-ch-ua headers
+  },
+  safari: {
+    // Safari doesn't send sec-ch-ua headers
+  },
+  edge: {
+    secChUa: '"Not_A Brand";v="8", "Chromium";v="120", "Microsoft Edge";v="120"',
+    secChUaMobile: '?0',
+    secChUaPlatform: '"Windows"',
+  }
+};
 
-// Track consecutive timeout errors for IP block detection
-let consecutiveTimeouts = 0;
-const TIMEOUT_THRESHOLD = 3; // Number of consecutive timeouts to trigger IP block warning
+// Session state to maintain consistency
+let sessionState = {
+  userAgent: null,
+  browserProfile: null,
+  sessionId: null,
+  requestCount: 0,
+  lastRequestTime: 0,
+  cookieJar: {},
+};
 
-/**
- * Enhanced logger with timestamp and context
- */
+// Enhanced logger
 const logger = {
   info: (message, context = {}) => {
     const timestamp = new Date().toISOString();
@@ -54,156 +88,292 @@ const logger = {
       console.log(`[${timestamp}] 🔍 ${message}`, Object.keys(context).length ? context : '');
     }
   },
-
-  ipBlock: (message, context = {}) => {
-    const timestamp = new Date().toISOString();
-    console.error(`\n${'='.repeat(80)}`);
-    console.error(`[${timestamp}] 🚫 IP BLOCK WARNING: ${message}`);
-    console.error(`${'='.repeat(80)}`);
-    if (Object.keys(context).length) {
-      console.error(JSON.stringify(context, null, 2));
-    }
-    console.error(`${'='.repeat(80)}\n`);
-  }
 };
 
 /**
- * Get rotating user agent (cycles through list)
- * @returns {string}
+ * Initialize session with consistent browser fingerprint
  */
-function getRotatingUserAgent() {
-  const agent = USER_AGENTS[currentUserAgentIndex];
-  currentUserAgentIndex = (currentUserAgentIndex + 1) % USER_AGENTS.length;
+function initializeSession() {
+  const browserTypes = ['chrome', 'chrome', 'chrome', 'firefox', 'edge', 'safari']; // Weighted toward Chrome
+  const selectedBrowser = browserTypes[Math.floor(Math.random() * browserTypes.length)];
   
-  if (process.env.DEBUG === 'true') {
-    logger.debug('Selected user agent', { 
-      index: currentUserAgentIndex,
-      agent: agent.substring(0, 50) + '...' 
-    });
+  // Select matching user agent
+  let userAgent;
+  if (selectedBrowser === 'chrome') {
+    const chromeAgents = USER_AGENTS.filter(ua => ua.includes('Chrome') && !ua.includes('Edg'));
+    userAgent = chromeAgents[Math.floor(Math.random() * chromeAgents.length)];
+  } else if (selectedBrowser === 'firefox') {
+    const firefoxAgents = USER_AGENTS.filter(ua => ua.includes('Firefox'));
+    userAgent = firefoxAgents[Math.floor(Math.random() * firefoxAgents.length)];
+  } else if (selectedBrowser === 'safari') {
+    const safariAgents = USER_AGENTS.filter(ua => ua.includes('Safari') && !ua.includes('Chrome'));
+    userAgent = safariAgents[Math.floor(Math.random() * safariAgents.length)];
+  } else if (selectedBrowser === 'edge') {
+    const edgeAgents = USER_AGENTS.filter(ua => ua.includes('Edg'));
+    userAgent = edgeAgents[Math.floor(Math.random() * edgeAgents.length)];
   }
   
-  return agent;
+  sessionState = {
+    userAgent,
+    browserProfile: BROWSER_PROFILES[selectedBrowser],
+    sessionId: crypto.randomBytes(16).toString('hex'),
+    requestCount: 0,
+    lastRequestTime: 0,
+    cookieJar: {},
+  };
+  
+  logger.info('Session initialized', {
+    browser: selectedBrowser,
+    userAgent: userAgent.substring(0, 60) + '...',
+    sessionId: sessionState.sessionId.substring(0, 8) + '...'
+  });
 }
 
 /**
- * Get random user agent (for backward compatibility)
- * @returns {string}
- */
-function getRandomUserAgent() {
-  const agent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-  if (process.env.DEBUG === 'true') {
-    logger.debug('Selected random user agent', { agent: agent.substring(0, 50) + '...' });
-  }
-  return agent;
-}
-
-/**
- * Sleep for specified milliseconds with human-like variation
- * @param {number} ms 
+ * Sleep with realistic human variation
  */
 function sleep(ms) {
-  // Add random jitter (±20%) to make timing more human-like
-  const jitter = ms * 0.2 * (Math.random() * 2 - 1);
-  const actualDelay = Math.max(ms + jitter, ms * 0.5);
-  if (process.env.DEBUG === 'true') {
-    logger.debug(`Sleeping for ${Math.round(actualDelay)}ms (base: ${ms}ms)`);
+  // More realistic variation: ±30% with occasional longer pauses
+  const shouldPauseLonger = Math.random() < 0.15; // 15% chance
+  
+  if (shouldPauseLonger) {
+    // Occasional distraction: 2-4x longer
+    const multiplier = 2 + Math.random() * 2;
+    ms = ms * multiplier;
+    logger.debug(`Extended pause (simulating distraction): ${Math.round(ms)}ms`);
   }
+  
+  const jitter = ms * 0.3 * (Math.random() * 2 - 1);
+  const actualDelay = Math.max(ms + jitter, ms * 0.6);
+  
+  if (process.env.DEBUG === 'true') {
+    logger.debug(`Sleeping for ${Math.round(actualDelay)}ms`);
+  }
+  
   return new Promise(resolve => setTimeout(resolve, actualDelay));
 }
 
 /**
- * Calculate exponential backoff delay with human-like patterns
- * @param {number} attempt 
- * @returns {number}
+ * Exponential backoff with realistic variation
  */
 function getBackoffDelay(attempt) {
-  // Increased base delay to 60 seconds (1 minute)
-  const baseDelay = 60000;
-  const maxDelay = 300000; // 5 minutes max
-  const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
-  const jitter = delay * 0.3 * (Math.random() * 2 - 1);
+  const baseDelay = 90000; // 1.5 minutes base
+  const maxDelay = 600000; // 10 minutes max
+  
+  // Add exponential component with randomness
+  const exponentialDelay = baseDelay * Math.pow(1.8, attempt);
+  const delay = Math.min(exponentialDelay, maxDelay);
+  
+  // Add significant jitter (±40%)
+  const jitter = delay * 0.4 * (Math.random() * 2 - 1);
+  
   return Math.max(delay + jitter, baseDelay);
 }
 
 /**
- * Human-like delay between actions - INCREASED DELAYS
- * @param {string} context - 'initial' | 'scroll' | 'fetch' | 'reading' | 'between_queries'
- * @returns {Promise<void>}
+ * Realistic human-like delays with multiple patterns
  */
-async function humanLikeDelay(context = 'default') {
+async function humanLikeDelay(context = 'default', pageNumber = 0) {
   let baseDelay = config.requestDelayMs || 1000;
   
   switch (context) {
     case 'initial':
-      // Initial page load - humans take 3-7 seconds to scan first results
-      baseDelay = Math.random() * 4000 + 3000;
+      // First page load: humans take time to scan results
+      baseDelay = 4000 + Math.random() * 4000; // 4-8 seconds
       break;
+      
     case 'scroll':
-      // Scrolling and clicking "load more" - 8-15 seconds
-      baseDelay = Math.random() * 7000 + 8000;
+      // Scrolling varies significantly
+      // First few pages: faster (eager)
+      // Later pages: slower (more careful evaluation)
+      if (pageNumber < 3) {
+        baseDelay = 6000 + Math.random() * 4000; // 6-10 seconds
+      } else if (pageNumber < 7) {
+        baseDelay = 8000 + Math.random() * 7000; // 8-15 seconds
+      } else {
+        baseDelay = 12000 + Math.random() * 10000; // 12-22 seconds (more careful on later pages)
+      }
+      
+      // Occasionally take longer (reading a result title/snippet)
+      if (Math.random() < 0.3) {
+        baseDelay *= 1.5;
+        logger.debug('Extended scroll delay (reading result)');
+      }
       break;
+      
     case 'reading':
-      // Reading results on page - 3-6 seconds
-      baseDelay = Math.random() * 3000 + 3000;
+      // Reading time varies by page number (fatigue factor)
+      if (pageNumber < 5) {
+        baseDelay = 3000 + Math.random() * 3000; // 3-6 seconds
+      } else {
+        baseDelay = 4000 + Math.random() * 5000; // 4-9 seconds (slower as tired)
+      }
       break;
+      
     case 'fetch':
-      // Clicking a link - 3-5 seconds
-      baseDelay = Math.random() * 2000 + 3000;
+      baseDelay = 3000 + Math.random() * 3000; // 3-6 seconds
       break;
+      
     case 'between_queries':
-      // CRITICAL: Much longer delay between queries - 3-5 minutes
-      baseDelay = Math.random() * 120000 + 180000; // 3-5 minutes
+      // Extended delay between different searches: 4-7 minutes
+      baseDelay = 240000 + Math.random() * 180000;
       break;
+      
+    case 'micro_pause':
+      // Tiny pauses (typing, mouse movement simulation)
+      baseDelay = 100 + Math.random() * 300; // 100-400ms
+      break;
+      
     default:
-      baseDelay = baseDelay * (0.5 + Math.random());
+      baseDelay = baseDelay * (0.7 + Math.random() * 0.6);
   }
   
   if (process.env.DEBUG === 'true') {
-    logger.debug(`Human-like delay: ${Math.round(baseDelay)}ms (context: ${context})`);
+    logger.debug(`Human-like delay: ${Math.round(baseDelay)}ms (context: ${context}, page: ${pageNumber})`);
   }
+  
   await sleep(baseDelay);
 }
 
 /**
- * Search DuckDuckGo with session persistence (like staying on same page)
- * REDUCED MAX_RETRIES to 2
- * @param {string} query - Search query
- * @param {string} region - Region code (e.g., 'us-en')
- * @param {number} maxPages - Maximum pages to load
- * @returns {Promise<object[]>} All results from all pages
+ * Generate realistic browser headers
  */
-export async function searchDuckDuckGo(query, region = 'wt-wt', maxPages = 10) {
-  logger.info(`Starting DuckDuckGo search session`, { query, region, maxPages });
+function generateHeaders(page = 0, previousUrl = null) {
+  const headers = {
+    'User-Agent': sessionState.userAgent,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': page === 0 ? 'none' : 'same-origin',
+    'Cache-Control': 'max-age=0',
+    'DNT': '1',
+  };
   
-  // Initial cooldown - 60-90 seconds
-  const initialDelay = Math.random() * 30000 + 60000;
-  logger.info(`🔍 Starting search - waiting ${Math.round(initialDelay / 1000)}s to space out requests`);
+  // Add browser-specific headers
+  if (sessionState.browserProfile.secChUa) {
+    headers['sec-ch-ua'] = sessionState.browserProfile.secChUa;
+    headers['sec-ch-ua-mobile'] = sessionState.browserProfile.secChUaMobile;
+    headers['sec-ch-ua-platform'] = sessionState.browserProfile.secChUaPlatform;
+  }
+  
+  // Add Sec-Fetch-User only on first page
+  if (page === 0) {
+    headers['Sec-Fetch-User'] = '?1';
+  }
+  
+  // Add referer for subsequent pages
+  if (page > 0 && previousUrl) {
+    headers['Referer'] = previousUrl;
+  }
+  
+  // Simulate cookies
+  if (Object.keys(sessionState.cookieJar).length > 0) {
+    headers['Cookie'] = Object.entries(sessionState.cookieJar)
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ');
+  }
+  
+  return headers;
+}
+
+/**
+ * Update cookies from response
+ */
+function updateCookies(response) {
+  const setCookieHeaders = response.headers['set-cookie'];
+  if (setCookieHeaders) {
+    setCookieHeaders.forEach(cookie => {
+      const [nameValue] = cookie.split(';');
+      const [name, value] = nameValue.split('=');
+      if (name && value) {
+        sessionState.cookieJar[name.trim()] = value.trim();
+      }
+    });
+  }
+}
+
+/**
+ * Detect rate limiting indicators
+ */
+function isRateLimited(response, html) {
+  // Multiple indicators of rate limiting
+  const indicators = [
+    response.status === 202,
+    response.status === 429,
+    response.status === 503,
+    html && html.length < 15000,
+    html && html.includes('slow down'),
+    html && html.includes('rate limit'),
+    html && html.includes('captcha'),
+    html && html.includes('automated'),
+  ];
+  
+  const detectedCount = indicators.filter(Boolean).length;
+  return detectedCount >= 2; // At least 2 indicators
+}
+
+/**
+ * Enhanced search with better anti-detection
+ */
+export async function searchDuckDuckGo(query, region = 'wt-wt', maxPages = 15) {
+  // Initialize session for this search
+  initializeSession();
+  
+  logger.info(`Starting DuckDuckGo search with enhanced stealth`, { query, region, maxPages });
+  
+  // Initial realistic delay: 30-60 seconds (human opening browser, typing query)
+  const initialDelay = 30000 + Math.random() * 30000;
+  logger.info(`🔍 Simulating human behavior - waiting ${Math.round(initialDelay / 1000)}s (opening browser, typing query)`);
   await sleep(initialDelay);
   
   const allResults = [];
-  const userAgent = getRotatingUserAgent();
+  
+  // Create axios instance with connection pooling for better performance
   const axiosInstance = axios.create({
-    timeout: 30000,
+    timeout: 35000,
     maxRedirects: 5,
+    validateStatus: (status) => status < 500, // Don't throw on 4xx
+    // Enable keep-alive for connection reuse
+    httpAgent: new http.Agent({ 
+      keepAlive: true, 
+      keepAliveMsecs: 30000,
+      maxSockets: 1,
+      maxFreeSockets: 1
+    }),
+    httpsAgent: new https.Agent({ 
+      keepAlive: true, 
+      keepAliveMsecs: 30000,
+      maxSockets: 1,
+      maxFreeSockets: 1
+    }),
   });
 
-  let lastError = null;
   let previousUrl = 'https://duckduckgo.com/';
-  let emptyPageRetries = 0;
-  const MAX_EMPTY_PAGE_RETRIES = 2;
-  const MAX_RETRIES = 2; // Reduced from 3
-
-  for (let page = 0; page < maxPages; page++) {
+  let consecutiveEmptyPages = 0;
+  let consecutiveRateLimits = 0;
+  const MAX_CONSECUTIVE_RATE_LIMITS = 2;
+  const MAX_RETRIES_PER_PAGE = 3;
+  
+  let page = 0; // Declare page variable outside loop
+  for (page = 0; page < maxPages; page++) {
     const offset = page * 30;
     
     try {
+      // Progressive delay increase based on page number
       if (page > 0) {
-        logger.info(`Scrolling to load more results (page ${page + 1})...`);
-        await humanLikeDelay('scroll');
+        logger.info(`Scrolling to page ${page + 1}...`);
+        await humanLikeDelay('scroll', page);
       } else {
         logger.info(`Loading initial search results...`);
-        await sleep(Math.random() * 1000 + 1000);
+        await humanLikeDelay('initial', page);
       }
+      
+      // Micro-pause before request (simulating mouse movement)
+      await humanLikeDelay('micro_pause');
 
       const params = new URLSearchParams({
         q: query,
@@ -215,138 +385,95 @@ export async function searchDuckDuckGo(query, region = 'wt-wt', maxPages = 10) {
       });
 
       const url = `https://html.duckduckgo.com/html/?${params.toString()}`;
+      const requestHeaders = generateHeaders(page, previousUrl);
       
       if (process.env.DEBUG === 'true') {
-        logger.debug('Requesting page', { page: page + 1, offset, url: url.substring(0, 100) + '...' });
+        logger.debug('Request details', { 
+          page: page + 1, 
+          offset,
+          headers: Object.keys(requestHeaders)
+        });
       }
-
-      const requestHeaders = {
-        'User-Agent': userAgent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': page === 0 ? 'none' : 'same-origin',
-        'Sec-Fetch-User': page === 0 ? '?1' : undefined,
-        'Referer': page > 0 ? previousUrl : undefined,
-        'Cache-Control': 'max-age=0',
-      };
 
       let response;
       let retrySuccess = false;
-      let pageRetries = 0;
       
-      // Modified retry logic with reduced attempts and IP block detection
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      for (let attempt = 0; attempt < MAX_RETRIES_PER_PAGE; attempt++) {
         try {
           if (attempt > 0) {
             const delay = getBackoffDelay(attempt);
-            logger.warn(`Retry attempt ${attempt + 1}/${MAX_RETRIES}`, { 
+            logger.warn(`Retry attempt ${attempt + 1}/${MAX_RETRIES_PER_PAGE}`, { 
               page: page + 1,
-              delay: Math.round(delay) + 'ms',
-              consecutiveTimeouts: consecutiveTimeouts
+              delaySeconds: Math.round(delay / 1000)
             });
             await sleep(delay);
           }
 
+          // Track request timing
+          sessionState.lastRequestTime = Date.now();
+          sessionState.requestCount++;
+
           response = await axiosInstance.get(url, { headers: requestHeaders });
           
-          // Success - reset timeout counter
-          consecutiveTimeouts = 0;
+          // Update cookies from response
+          updateCookies(response);
           
-          // Check if response looks valid or is rate limited
-          if (response.status === 202 || !response.data || response.data.length < 15000) {
-            logger.warn(`Possible rate limit detected`, { 
+          // Check for rate limiting
+          if (isRateLimited(response, response.data)) {
+            consecutiveRateLimits++;
+            
+            logger.warn(`Rate limit detected (${consecutiveRateLimits} consecutive)`, { 
               status: response.status,
               contentLength: response.data?.length,
               page: page + 1 
             });
             
-            if (pageRetries < MAX_EMPTY_PAGE_RETRIES) {
-              pageRetries++;
-              // Longer wait on rate limit - 60-90 seconds
-              const rateLimitDelay = Math.random() * 30000 + 60000;
-              logger.info(`Waiting ${Math.round(rateLimitDelay / 1000)}s before retry due to possible rate limit`);
-              await sleep(rateLimitDelay);
+            if (consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+              logger.error('Multiple consecutive rate limits detected - pausing');
+              
+              // Long pause: 5-8 minutes
+              const pauseDelay = 300000 + Math.random() * 180000;
+              logger.info(`⏸️  Taking extended break: ${Math.round(pauseDelay / 1000)}s (5-8 min) - simulating human giving up and doing something else`);
+              await sleep(pauseDelay);
+              
+              // Reset session after long pause
+              logger.info('Creating new session after extended break');
+              initializeSession();
+              consecutiveRateLimits = 0;
+              
+              // Retry this page with new session
               continue;
             }
+            
+            // Shorter pause for first rate limit: 90-150 seconds
+            const rateLimitDelay = 90000 + Math.random() * 60000;
+            logger.info(`Waiting ${Math.round(rateLimitDelay / 1000)}s before retry`);
+            await sleep(rateLimitDelay);
+            continue;
           }
           
+          // Success - reset rate limit counter
+          consecutiveRateLimits = 0;
           retrySuccess = true;
           break;
+          
         } catch (error) {
-          lastError = error;
+          logger.error(`Request error on attempt ${attempt + 1}`, {
+            error: error.message,
+            code: error.code,
+            status: error.response?.status
+          });
           
-          // Track ETIMEDOUT errors specifically for IP block detection
-          if (error.code === 'ETIMEDOUT') {
-            consecutiveTimeouts++;
+          // Network errors - retry with backoff
+          if (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET' || 
+              error.code === 'ECONNABORTED' || error.code === 'ENOTFOUND') {
             
-            logger.warn(`Connection timeout (${consecutiveTimeouts} consecutive)`, { 
-              errorCode: error.code,
-              address: error.address,
-              page: page + 1,
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES
-            });
-            
-            // Check if we've hit the threshold for IP block warning
-            if (consecutiveTimeouts >= TIMEOUT_THRESHOLD) {
-              logger.ipBlock('Repeated connection timeouts detected - Your IP may be blocked', {
-                consecutiveTimeouts: consecutiveTimeouts,
-                query: query,
-                region: region,
-                recommendation: [
-                  '1. Your IP address is likely temporarily blocked due to frequent requests',
-                  '2. Wait 30-60 minutes before retrying',
-                  '3. Consider using a VPN or proxy service',
-                  '4. Increase delays between requests (currently using 3-5 min between queries)',
-                  '5. Reduce maxPages per query to minimize request frequency'
-                ],
-                technicalDetails: {
-                  errorCode: error.code,
-                  targetAddress: error.address || 'unknown',
-                  currentQuery: query,
-                  pageAttempted: page + 1
-                }
-              });
+            if (attempt < MAX_RETRIES_PER_PAGE - 1) {
+              const delay = getBackoffDelay(attempt);
+              logger.info(`Network error - waiting ${Math.round(delay / 1000)}s before retry`);
+              await sleep(delay);
+              continue;
             }
-          }
-          
-          if (error.code === 'ECONNRESET' || 
-              error.code === 'ETIMEDOUT' || 
-              error.code === 'ECONNABORTED' ||
-              error.code === 'ENOTFOUND' ||
-              error.code === 'EAI_AGAIN' ||
-              error.response?.status === 429 ||
-              error.response?.status === 503 ||
-              error.response?.status === 522 ||
-              error.response?.status >= 500) {
-            
-            // Additional specific warning for explicit rate limit responses
-            if (error.response?.status === 429) {
-              logger.ipBlock('HTTP 429 Too Many Requests - Rate limit exceeded', {
-                status: error.response.status,
-                query: query,
-                page: page + 1,
-                recommendation: [
-                  'DuckDuckGo has explicitly rate-limited your requests',
-                  'Wait at least 1 hour before resuming',
-                  'Consider switching to a different IP address',
-                  'Reduce request frequency significantly'
-                ]
-              });
-            }
-            
-            logger.warn('Transient error, will retry', { 
-              errorType: error.code || `HTTP ${error.response?.status}`,
-              attempt: attempt + 1,
-              maxRetries: MAX_RETRIES
-            });
-            continue;
           }
           
           throw error;
@@ -354,28 +481,11 @@ export async function searchDuckDuckGo(query, region = 'wt-wt', maxPages = 10) {
       }
 
       if (!retrySuccess) {
-        logger.error(`Failed to load page ${page + 1} after ${MAX_RETRIES} attempts`, {
-          lastError: lastError?.message,
-          consecutiveTimeouts: consecutiveTimeouts
-        });
-        
-        // Additional warning if multiple pages failed
-        if (page === 0) {
-          logger.ipBlock('Failed on first page - Strong indicator of IP block', {
-            query: query,
-            recommendation: [
-              'Unable to load even the first page of results',
-              'This strongly suggests your IP is blocked',
-              'Stop the script and wait 30-60 minutes',
-              'Consider using a VPN or different network'
-            ]
-          });
-        }
-        
+        logger.error(`Failed to load page ${page + 1} after ${MAX_RETRIES_PER_PAGE} attempts`);
         break;
       }
 
-      logger.success('Page loaded successfully', { 
+      logger.success('Page loaded', { 
         page: page + 1,
         statusCode: response.status,
         contentLength: response.data?.length 
@@ -388,87 +498,84 @@ export async function searchDuckDuckGo(query, region = 'wt-wt', maxPages = 10) {
       if (results.length > 0) {
         allResults.push(...results);
         logger.success(`Found ${results.length} results on page ${page + 1} (total: ${allResults.length})`);
-        emptyPageRetries = 0; // Reset empty page counter
-        await humanLikeDelay('reading');
-      } else {
-        emptyPageRetries++;
-        logger.warn(`No results found on page ${page + 1}, retry ${emptyPageRetries}/${MAX_EMPTY_PAGE_RETRIES}`);
+        consecutiveEmptyPages = 0;
         
-        if (emptyPageRetries >= MAX_EMPTY_PAGE_RETRIES) {
-          logger.warn(`Stopping after ${MAX_EMPTY_PAGE_RETRIES} consecutive empty pages`);
+        // Realistic reading time
+        await humanLikeDelay('reading', page);
+      } else {
+        consecutiveEmptyPages++;
+        logger.warn(`No results on page ${page + 1} (${consecutiveEmptyPages} consecutive empty)`);
+        
+        if (consecutiveEmptyPages >= 2) {
+          logger.info('Multiple empty pages - assuming end of results');
           break;
         }
-        
-        // Try the same page again with different parameters
-        page--; // Stay on same page index
-        continue;
-      }
-
-      if (page + 1 >= maxPages) {
-        logger.info(`Reached maximum pages (${maxPages})`);
-        break;
       }
 
     } catch (error) {
       logger.error(`Error on page ${page + 1}`, {
         error: error.message,
         code: error.code,
-        status: error.response?.status,
-        consecutiveTimeouts: consecutiveTimeouts
+        status: error.response?.status
       });
+      
+      // Handle different error types intelligently
+      const isNetworkError = ['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN'].includes(error.code);
+      const isRateLimitError = error.response?.status === 429 || error.response?.status === 503;
+      
+      // Don't immediately give up on transient errors
+      if (isNetworkError || isRateLimitError) {
+        logger.warn('Transient error detected - taking break before retry', {
+          errorType: isNetworkError ? 'network' : 'rate_limit',
+          page: page + 1
+        });
+        
+        // Longer pause for rate limits, shorter for network issues
+        const pauseMs = isRateLimitError ? (120000 + Math.random() * 60000) : (30000 + Math.random() * 30000);
+        logger.info(`⏸️  Pausing ${Math.round(pauseMs / 1000)}s before retry`);
+        await sleep(pauseMs);
+        
+        // Retry same page
+        page--;
+        continue;
+      }
+      
+      // For early pages, be more persistent
+      if (page < 5) {
+        logger.warn('Early page error - will retry after break');
+        await sleep(60000 + Math.random() * 30000); // 60-90 second break
+        page--; // Retry same page
+        continue;
+      }
+      
+      // Later pages: stop on persistent errors
       break;
     }
   }
 
-  logger.success(`Search session completed: ${allResults.length} total results`, { query });
-  
-  // Final warning if we had timeout issues
-  if (consecutiveTimeouts >= TIMEOUT_THRESHOLD) {
-    logger.warn(`Search completed with ${consecutiveTimeouts} consecutive timeouts - Consider pausing scraping activity`, {
-      totalResults: allResults.length,
-      recommendation: 'Wait 30-60 minutes before starting next batch of queries'
-    });
-  }
+  logger.success(`Search completed: ${allResults.length} total results`, { 
+    query,
+    pagesScraped: Math.min(page + 1, maxPages),
+    sessionRequests: sessionState.requestCount
+  });
   
   return allResults;
 }
 
 /**
- * Execute multiple searches sequentially with human-like delays between queries
- * INCREASED delays to 3-5 minutes between queries
- * @param {Array<{query: string, region?: string, maxPages?: number}>} searchConfigs 
- * @returns {Promise<Array<{query: string, success: boolean, results: Array, count: number, error?: string}>>}
+ * Execute multiple searches with enhanced delays
  */
 export async function executeMultipleSearches(searchConfigs) {
   const results = [];
   
-  logger.info(`🚀 Executing ${searchConfigs.length} searches sequentially with human-like delays`);
+  logger.info(`🚀 Executing ${searchConfigs.length} searches with realistic human behavior`);
   
   for (let i = 0; i < searchConfigs.length; i++) {
-    const { query, region = 'wt-wt', maxPages = 10 } = searchConfigs[i];
+    const { query, region = 'wt-wt', maxPages = 15 } = searchConfigs[i];
     
     logger.info(`\n${'='.repeat(80)}`);
     logger.info(`📊 Starting search ${i + 1}/${searchConfigs.length}`, { query });
     logger.info(`${'='.repeat(80)}\n`);
-    
-    // Check if we should pause due to IP block indicators
-    if (consecutiveTimeouts >= TIMEOUT_THRESHOLD) {
-      logger.ipBlock('Pausing search execution due to repeated timeouts', {
-        consecutiveTimeouts: consecutiveTimeouts,
-        searchesCompleted: i,
-        searchesRemaining: searchConfigs.length - i,
-        action: 'Waiting 10 minutes before continuing',
-        recommendation: 'Consider stopping the script entirely and waiting 30-60 minutes'
-      });
-      
-      // Wait 10 minutes before attempting next search
-      const pauseDelay = 10 * 60 * 1000; // 10 minutes
-      logger.info(`⏸️  Pausing for ${pauseDelay / 1000}s (10 minutes) to allow IP cooldown...`);
-      await sleep(pauseDelay);
-      
-      // Reset counter to give it another try
-      consecutiveTimeouts = 0;
-    }
     
     try {
       const searchResults = await searchDuckDuckGo(query, region, maxPages);
@@ -481,16 +588,16 @@ export async function executeMultipleSearches(searchConfigs) {
         timestamp: new Date().toISOString()
       });
       
-      logger.success(`✨ Search ${i + 1} completed successfully`, { 
+      logger.success(`✨ Search ${i + 1} completed`, { 
         query, 
         resultsFound: searchResults.length 
       });
       
-      // Critical: Wait between different queries (3-5 minutes)
+      // Long delay between queries: 4-7 minutes
       if (i < searchConfigs.length - 1) {
-        const delayMs = Math.random() * 120000 + 180000; // 3-5 minutes
-        const delaySeconds = Math.round(delayMs / 1000);
-        logger.info(`⏳ Waiting ${delaySeconds}s before next query to avoid rate limits...`);
+        const delayMs = 240000 + Math.random() * 180000;
+        const delayMinutes = Math.round(delayMs / 60000);
+        logger.info(`⏳ Taking break before next search: ${delayMinutes} minutes (simulating human behavior)`);
         await humanLikeDelay('between_queries');
       }
       
@@ -505,11 +612,11 @@ export async function executeMultipleSearches(searchConfigs) {
         timestamp: new Date().toISOString()
       });
       
-      // Still wait before next query even on error (shorter delay - 1-2 minutes)
+      // Even on error, wait before next query
       if (i < searchConfigs.length - 1) {
-        const errorDelayMs = Math.random() * 60000 + 60000; // 1-2 minutes
-        logger.info(`⏳ Waiting ${Math.round(errorDelayMs / 1000)}s before next query despite error...`);
-        await sleep(errorDelayMs);
+        const errorDelay = 120000 + Math.random() * 60000; // 2-3 minutes
+        logger.info(`⏳ Waiting ${Math.round(errorDelay / 60000)} minutes despite error`);
+        await sleep(errorDelay);
       }
     }
   }
@@ -522,7 +629,7 @@ export async function executeMultipleSearches(searchConfigs) {
   const successCount = results.filter(r => r.success).length;
   const totalResults = results.reduce((sum, r) => sum + r.count, 0);
   
-  logger.info(`📈 Summary: ${successCount}/${searchConfigs.length} searches successful, ${totalResults} total results found`);
+  logger.info(`📈 Summary: ${successCount}/${searchConfigs.length} successful, ${totalResults} total results`);
   
   results.forEach((result, idx) => {
     const status = result.success ? '✅' : '❌';
@@ -531,44 +638,18 @@ export async function executeMultipleSearches(searchConfigs) {
   
   logger.info(`${'='.repeat(80)}\n`);
   
-  // Final IP block assessment
-  if (consecutiveTimeouts >= TIMEOUT_THRESHOLD) {
-    logger.ipBlock('CRITICAL: IP block detected during batch execution', {
-      consecutiveTimeouts: consecutiveTimeouts,
-      successfulSearches: successCount,
-      totalSearches: searchConfigs.length,
-      urgentAction: [
-        'STOP all scraping activity immediately',
-        'Your IP is likely blocked by DuckDuckGo',
-        'Wait at least 1 hour before any retry attempts',
-        'Consider using a VPN or proxy for future scraping',
-        'Reduce scraping frequency significantly'
-      ]
-    });
-  }
-  
   return results;
 }
 
 /**
- * Parse DuckDuckGo HTML results
- * @param {string} html 
- * @returns {object[]}
+ * Parse DuckDuckGo results (unchanged)
  */
 function parseDuckDuckGoResults(html) {
   const results = [];
   
   try {
-    if (process.env.DEBUG === 'true') {
-      logger.debug('Parsing DuckDuckGo HTML results');
-    }
-    
     const root = parse(html);
     const resultElements = root.querySelectorAll('.result');
-
-    if (process.env.DEBUG === 'true') {
-      logger.debug(`Found ${resultElements.length} result elements`);
-    }
 
     for (const element of resultElements) {
       try {
@@ -593,30 +674,19 @@ function parseDuckDuckGoResults(html) {
           snippet,
           displayUrl,
         });
-
-        if (process.env.DEBUG === 'true') {
-          logger.debug('Parsed result', { 
-            url: url.substring(0, 60) + '...',
-            title: title.substring(0, 50) + '...' 
-          });
-        }
       } catch (e) {
-        logger.warn('Error parsing individual result', { error: e.message });
+        // Skip invalid results
       }
     }
-    
-    logger.success(`Successfully parsed ${results.length} results`);
   } catch (e) {
-    logger.error('Error parsing DuckDuckGo results', { error: e.message });
+    logger.error('Error parsing results', { error: e.message });
   }
 
   return results;
 }
 
 /**
- * Extract actual URL from DuckDuckGo redirect URL
- * @param {string} ddgUrl 
- * @returns {string|null}
+ * Extract URL from DuckDuckGo redirect (unchanged)
  */
 function extractUrlFromDDG(ddgUrl) {
   try {
@@ -646,128 +716,77 @@ function extractUrlFromDDG(ddgUrl) {
 }
 
 /**
- * Fetch page content for email extraction
- * REDUCED MAX_RETRIES to 2
- * @param {string} url 
- * @returns {Promise<string|null>}
+ * Fetch page content with anti-detection
  */
 export async function fetchPageContent(url) {
-  logger.info(`Fetching page content`, { url: url.substring(0, 80) + '...' });
+  logger.info(`Fetching page`, { url: url.substring(0, 60) + '...' });
   
-  let lastError = null;
-  const MAX_RETRIES = 2; // Reduced from 3
+  // Simulate thinking/deciding time before clicking
+  await humanLikeDelay('micro_pause');
+  
+  const MAX_RETRIES = 3;
   
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt);
-        logger.warn(`Retry attempt ${attempt + 1}/${MAX_RETRIES} for fetch`, { 
-          url: url.substring(0, 60) + '...',
-          delay: Math.round(delay) + 'ms' 
+        logger.warn(`Retry ${attempt + 1}/${MAX_RETRIES}`, { 
+          url: url.substring(0, 50) + '...',
+          delaySeconds: Math.round(delay / 1000)
         });
         await sleep(delay);
       }
 
-      if (process.env.DEBUG === 'true') {
-        logger.debug('Sending fetch request', { url });
-      }
-
       const response = await axios.get(url, {
         headers: {
-          'User-Agent': getRotatingUserAgent(),
+          'User-Agent': sessionState.userAgent || USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate',
           'DNT': '1',
           'Connection': 'keep-alive',
           'Upgrade-Insecure-Requests': '1',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'none',
           'Cache-Control': 'max-age=0',
         },
-        timeout: 20000,
+        timeout: 25000,
         maxRedirects: 5,
-        maxContentLength: 5 * 1024 * 1024, // 5MB max
+        maxContentLength: 5 * 1024 * 1024,
       });
 
       logger.success('Fetch successful', { 
-        url: url.substring(0, 60) + '...',
-        statusCode: response.status,
-        contentLength: response.data?.length,
-        contentType: response.headers['content-type']
+        url: url.substring(0, 50) + '...',
+        statusCode: response.status
       });
 
-      // Human-like delay after fetching (3-5 seconds to "read" the page)
+      // Simulate reading time
       await humanLikeDelay('fetch');
 
       return response.data;
     } catch (error) {
-      lastError = error;
-      
       logger.error(`Fetch attempt ${attempt + 1} failed`, {
-        url: url.substring(0, 60) + '...',
-        error: error.message,
-        code: error.code,
-        status: error.response?.status
+        url: url.substring(0, 50) + '...',
+        error: error.message
       });
       
-      if (error.code === 'ECONNRESET' || 
-          error.code === 'ETIMEDOUT' || 
-          error.code === 'ECONNABORTED' ||
-          error.code === 'ENOTFOUND' ||
-          error.code === 'EAI_AGAIN' ||
-          error.response?.status === 429 ||
-          error.response?.status === 503 ||
-          error.response?.status === 522 ||
-          error.response?.status >= 500) {
-        logger.warn('Transient error, will retry', { 
-          errorType: error.code || `HTTP ${error.response?.status}` 
-        });
-        continue;
+      // Non-retryable errors
+      if (error.response?.status === 404 || error.response?.status === 403) {
+        return null;
       }
-      
-      // Non-retryable error (404, 403, etc.)
-      logger.warn('Non-retryable error, skipping URL', { 
-        url: url.substring(0, 60) + '...',
-        status: error.response?.status,
-        error: error.message 
-      });
-      return null;
     }
   }
 
-  logger.error(`Failed to fetch after ${MAX_RETRIES} attempts`, { 
-    url: url.substring(0, 60) + '...',
-    lastError: lastError?.message 
-  });
+  logger.error(`Failed to fetch after ${MAX_RETRIES} attempts`, { url: url.substring(0, 50) + '...' });
   return null;
 }
 
 /**
- * Build search query
- * @param {string} keyword - Opportunity keyword (e.g., "write for us")
- * @param {string} niche - Niche keyword (e.g., "fashion")
- * @param {string} [tld] - Country TLD filter (e.g., ".ca")
- * @param {string} [countryName] - Country name (e.g., "Canada")
- * @returns {string}
+ * Build search query (unchanged)
  */
 export function buildSearchQuery(keyword, niche, tld = null, countryName = null) {
-  // Format: niche + keyword + country (e.g., "fashion write for us Canada")
   let query = `${niche} ${keyword}`;
   
   if (countryName) {
     query += ` ${countryName}`;
-  }
-///////////////////////  
-/*
-  if (tld) {
-    query += ` site:*${tld}`;
-  }
-///////////*/    
-/////////////////////////////  
-  if (process.env.DEBUG === 'true') {
-    logger.debug('Built search query', { query, keyword, niche, tld, countryName });
   }
   
   return query;

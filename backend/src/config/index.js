@@ -15,9 +15,9 @@ export const config = {
 export const searchKeywords = {
   guestPost: [
     'write for us',
-    'guest post',
+/*    'guest post',
     'submit article',
-/*    'contribute',
+    'contribute',
     'guest author',
     'submit guest post',
     'become a contributor',
